@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Ascenso Pixel - Estilo Celeste</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #1a1a2e;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+            font-family: 'Press Start 2P', cursive;
+            color: white;
+        }
+
+        #game-container {
+            position: relative;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            border: 4px solid #4a4e69;
+        }
+
+        canvas {
+            display: block;
+            background-color: #22223b;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            pointer-events: none;
+            text-shadow: 2px 2px 0 #000;
+        }
+
+        .controls-hint {
+            position: absolute;
+            bottom: 10px;
+            width: 100%;
+            text-align: center;
+            font-size: 10px;
+            color: #9a8c98;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <div id="ui-layer">
+        <div>NIVEL: <span id="level-display">1</span></div>
+        <div style="margin-top:10px; color:#ff6b6b">MUERTES: <span id="death-display">0</span></div>
+    </div>
+    <div class="controls-hint">MOVER: Flechas/WASD | SALTAR: Z/Espacio | DASH: X/Shift | REINICIAR: R</div>
+</div>
+
+<script>
+/**
+ * MOTOR DEL JUEGO
+ * Inspirado en la física de Celeste: Gravedad constante, fricción en el aire,
+ * dash preciso y colisiones AABB.
+ */
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// --- CONFIGURACIÓN Y CONSTANTES ---
+const TILE_SIZE = 40;
+const GRAVITY = 0.5; // Gravedad fuerte para sensación de peso
+const FRICTION = 0.8;
+const ACCEL = 0.8;
+const MAX_SPEED = 6;
+const JUMP_FORCE = -9.5;
+const DASH_SPEED = 12;
+const DASH_DURATION = 10; // Frames
+const DASH_COOLDOWN = 25; // Frames
+
+// Colores Estilo Celeste
+const COLORS = {
+    player: '#ff6b6b', // Rojo suave
+    wall: '#4a4e69',   // Gris azulado
+    spike: '#c1121f',  // Rojo peligro
+    goal: '#fca311',   // Dorado
+    bg: '#22223b',     // Fondo oscuro
+    wind: 'rgba(100, 200, 255, 0.2)',
+    particle: '#ffffff'
+};
+
+// --- INPUT ---
+const keys = {
+    left: false, right: false, up: false, down: false,
+    jump: false, dash: false, restart: false
+};
+
+window.addEventListener('keydown', (e) => {
+    if(e.key === 'ArrowLeft' || e.key === 'a') keys.left = true;
+    if(e.key === 'ArrowRight' || e.key === 'd') keys.right = true;
+    if(e.key === 'ArrowUp' || e.key === 'w') keys.up = true;
+    if(e.key === 'ArrowDown' || e.key === 's') keys.down = true;
+    if(e.key === ' ' || e.key === 'z' || e.key === 'k') keys.jump = true;
+    if(e.key === 'x' || e.key === 'Shift' || e.key === 'l') keys.dash = true;
+    if(e.key === 'r' || e.key === 'R') keys.restart = true;
+});
+
+window.addEventListener('keyup', (e) => {
+    if(e.key === 'ArrowLeft' || e.key === 'a') keys.left = false;
+    if(e.key === 'ArrowRight' || e.key === 'd') keys.right = false;
+    if(e.key === 'ArrowUp' || e.key === 'w') keys.up = false;
+    if(e.key === 'ArrowDown' || e.key === 's') keys.down = false;
+    if(e.key === ' ' || e.key === 'z' || e.key === 'k') keys.jump = false;
+    if(e.key === 'x' || e.key === 'Shift' || e.key === 'l') keys.dash = false;
+});
+
+// --- CLASES ---
+
+class Particle {
+    constructor(x, y, color, speed, life) {
+        this.x = x;
+        this.y = y;
+        this.color = color;
+        this.vx = (Math.random() - 0.5) * speed;
+        this.vy = (Math.random() - 0.5) * speed;
+        this.life = life;
+        this.maxLife = life;
+        this.size = Math.random() * 4 + 2;
+    }
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.life--;
+        this.size *= 0.95;
+    }
+    draw(ctx, camX, camY) {
+        ctx.globalAlpha = this.life / this.maxLife;
+        ctx.fillStyle = this.color;
+        ctx.fillRect(this.x - camX, this.y - camY, this.size, this.size);
+        ctx.globalAlpha = 1;
+    }
+}
+
+class Player {
+    constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.w = 24; // Hitbox más pequeña que el tile para forgiving gameplay
+        this.h = 24;
+        this.vx = 0;
+        this.vy = 0;
+        this.grounded = false;
+        this.canDoubleJump = false;
+        
+        // Dash mechanics
+        this.dashing = false;
+        this.dashTimer = 0;
+        this.dashCooldownTimer = 0;
+        this.dashDir = {x:0, y:0};
+        
+        // Visuals
+        this.facing = 1;
+        this.trail = [];
+    }
+
+    update(map, entities) {
+        // 1. Manejo de Dash
+        if (keys.dash && this.dashCooldownTimer <= 0 && !this.dashing) {
+            this.startDash();
+        }
+
+        if (this.dashing) {
+            this.dashTimer--;
+            this.vx = this.dashDir.x * DASH_SPEED;
+            this.vy = this.dashDir.y * DASH_SPEED;
+            
+            // Efecto de estela
+            if(this.dashTimer % 2 === 0) {
+                this.trail.push({x: this.x, y: this.y, alpha: 0.8});
+            }
+
+            if (this.dashTimer <= 0) {
+                this.dashing = false;
+                this.vx = 0;
+                this.vy = 0;
+                this.dashCooldownTimer = DASH_COOLDOWN;
+            }
+        } else {
+            // 2. Movimiento Normal
+            if (keys.left) {
+                this.vx -= ACCEL;
+                this.facing = -1;
+            }
+            if (keys.right) {
+                this.vx += ACCEL;
+                this.facing = 1;
+            }
+
+            // Fricción y límites
+            this.vx *= FRICTION;
+            this.vy += GRAVITY;
+
+            // Zonas de viento (Entidades tipo 'wind')
+            entities.forEach(e => {
+                if(e.type === 'wind' && this.checkOverlap(e)) {
+                    this.vx += e.vx || 0;
+                    this.vy += e.vy || 0;
+                }
+            });
+
+            // Limitar velocidad máxima
+            if (Math.abs(this.vx) > MAX_SPEED) this.vx = MAX_SPEED * Math.sign(this.vx);
+            if (this.vy > 12) this.vy = 12; // Terminal velocity
+
+            // 3. Salto
+            if (keys.jump) {
+                if (this.grounded) {
+                    this.vy = JUMP_FORCE;
+                    this.grounded = false;
+                    this.canDoubleJump = true;
+                    this.spawnParticles(5);
+                    keys.jump = false; // Evitar spam
+                } else if (this.canDoubleJump) {
+                    this.vy = JUMP_FORCE * 0.8;
+                    this.canDoubleJump = false;
+                    this.spawnParticles(8);
+                    keys.jump = false;
+                }
+            }
+        }
+
+        if (this.dashCooldownTimer > 0) this.dashCooldownTimer--;
+
+        // 4. Aplicar Movimiento y Colisiones
+        this.x += this.vx;
+        this.checkCollision(map, 'x', entities);
+        this.y += this.vy;
+        this.checkCollision(map, 'y', entities);
+
+        // 5. Muerte por caída
+        if (this.y > map.height * TILE_SIZE + 100) {
+            die();
+        }
+
+        // Limpiar estela
+        if(this.trail.length > 5) this.trail.shift();
+    }
+
+    startDash() {
+        this.dashing = true;
+        this.dashTimer = DASH_DURATION;
+        
+        // Calcular dirección (8 direcciones)
+        let dx = 0, dy = 0;
+        if (keys.left) dx = -1;
+        if (keys.right) dx = 1;
+        if (keys.up) dy = -1;
+        if (keys.down) dy = 1;
+
+        // Si no hay input, dash hacia donde mira
+        if (dx === 0 && dy === 0) {
+            dx = this.facing;
+        } else if (dx !== 0 && dy !== 0) {
+            // Normalizar diagonal
+            const len = Math.sqrt(dx*dx + dy*dy);
+            dx /= len;
+            dy /= len;
+        }
+        
+        this.dashDir = {x: dx, y: dy};
+        this.spawnParticles(10);
+    }
+
+    checkCollision(map, axis, entities) {
+        // Colisión con Tiles (Mapa)
+        // Convertir posición a coordenadas de grid
+        let left = Math.floor(this.x / TILE_SIZE);
+        let right = Math.floor((this.x + this.w) / TILE_SIZE);
+        let top = Math.floor(this.y / TILE_SIZE);
+        let bottom = Math.floor((this.y + this.h) / TILE_SIZE);
+
+        // Revisar tiles en el rango
+        for (let y = top; y <= bottom; y++) {
+            for (let x = left; x <= right; x++) {
+                let tile = map.getTile(x, y);
+                if (tile === '#') { // Pared sólida
+                    if (axis === 'x') {
+                        if (this.vx > 0) this.x = x * TILE_SIZE - this.w - 0.01;
+                        if (this.vx < 0) this.x = (x + 1) * TILE_SIZE + 0.01;
+                        this.vx = 0;
+                        if(this.dashing) this.dashTimer = 0; // Cancelar dash al chocar
+                    } else {
+                        if (this.vy > 0) {
+                            this.y = y * TILE_SIZE - this.h - 0.01;
+                            this.grounded = true;
+                            this.canDoubleJump = false;
+                        }
+                        if (this.vy < 0) {
+                            this.y = (y + 1) * TILE_SIZE + 0.01;
+                        }
+                        this.vy = 0;
+                        if(this.dashing) this.dashTimer = 0;
+                    }
+                } else if (tile === '^') { // Pinchos
+                    this.checkDeath(x, y, TILE_SIZE, TILE_SIZE);
+                } else if (tile === 'E') { // Meta
+                    nextLevel();
+                }
+            }
+        }
+
+        // Colisión con Entidades (Pinchos flotantes, móviles)
+        entities.forEach(e => {
+            if (e.type === 'spike' || e.type === 'moving_platform') {
+                // Hitbox simple
+                if (this.x < e.x + e.w && this.x + this.w > e.x &&
+                    this.y < e.y + e.h && this.y + this.h > e.y) {
+                    
+                    if (e.type === 'spike') {
+                        die();
+                    } else if (e.type === 'moving_platform') {
+                        // Empujar jugador
+                        if (axis === 'y' && this.vy > 0 && this.y + this.h <= e.y + e.vy + 5) {
+                             this.y = e.y - this.h;
+                             this.grounded = true;
+                             this.x += e.vx; // Moverse con la plataforma
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    checkDeath(ex, ey, ew, eh) {
+        // AABB simple para muerte
+        if (this.x < ex + ew - 5 && this.x + this.w > ex + 5 &&
+            this.y < ey + eh - 5 && this.y + this.h > ey + 5) {
+            die();
+        }
+    }
+
+    checkOverlap(rect) {
+        return (this.x < rect.x + rect.w && this.x + this.w > rect.x &&
+                this.y < rect.y + rect.h && this.y + this.h > rect.y);
+    }
+
+    spawnParticles(count) {
+        for(let i=0; i<count; i++) {
+            particles.push(new Particle(this.x + this.w/2, this.y + this.h/2, COLORS.particle, 4, 20));
+        }
+    }
+
+    draw(ctx, camX, camY) {
+        // Dibujar estela
+        this.trail.forEach(t => {
+            ctx.fillStyle = `rgba(255, 107, 107, ${t.alpha})`;
+            ctx.fillRect(t.x - camX, t.y - camY, this.w, this.h);
+            t.alpha -= 0.1;
+        });
+
+        // Dibujar Jugador
+        ctx.fillStyle = COLORS.player;
+        // Pequeño squash and stretch si salta
+        let drawW = this.w;
+        let drawH = this.h;
+        let drawX = this.x;
+        let drawY = this.y;
+
+        if(!this.grounded && Math.abs(this.vy) > 2) {
+            drawW = this.w * 0.8;
+            drawH = this.h * 1.2;
+            drawX += (this.w - drawW)/2;
+        }
+
+        ctx.fillRect(drawX - camX, drawY - camY, drawW, drawH);
+        
+        // Ojos (para dirección)
+        ctx.fillStyle = 'white';
+        let eyeOff = this.facing === 1 ? 4 : -4;
+        ctx.fillRect(drawX - camX + drawW/2 + eyeOff - 2, drawY - camY + 4, 4, 4);
+    }
+}
+
+// --- GESTIÓN DE NIVELES ---
+
+// Mapas definidos por strings
+// # = Pared, ^ = Pincho, P = Start, E = Exit, M = Plataforma Móvil, W = Viento, . = Aire
+const levels = [
+    [ // NIVEL 1: Básico
+        "####################",
+        "#..................#",
+        "#..................#",
+        "#P.................#",
+        "#####...^^^...#####",
+        "#..................#",
+        "#.......###........#",
+        "#...###.....###....#",
+        "#..................#",
+        "#.........E........#",
+        "####################"
+    ],
+    [ // NIVEL 2: Plataformas Móviles y Dash
+        "####################",
+        "#E.................#",
+        "###................#",
+        "#.......M..........#",
+        "#.....#####........#",
+        "#..................#",
+        "#..........M.......#",
+        "#........#####.....#",
+        "#P.................#",
+        "#^^^^^^^^^^^^^^^^^^#",
+        "####################"
+    ],
+    [ // NIVEL 3: Viento y Precisión
+        "####################",
+        "#................E#",
+        "#......^^^.........#",
+        "#.....#####........#",
+        "#..................#",
+        "#...WWWWWWWW.......#",
+        "#...#.....#........#",
+        "#...#..P..#........#",
+        "#...#.....#...^^^..#",
+        "####################"
+    ],
+    [ // NIVEL 4: El Reto Final (Todo junto)
+        "####################",
+        "#E.................#",
+        "###...^^^...M......#",
+        "#.....###..........#",
+        "#..................#",
+        "#...W...M...W......#",
+        "#...#...#...#......#",
+        "#...#...#...#...^^^#",
+        "#P..#...#...#..#####",
+        "####################"
+    ]
+];
+
+let currentLevelIdx = 0;
+let mapData = [];
+let entities = [];
+let player;
+let particles = [];
+let deaths = 0;
+let camera = {x: 0, y: 0};
+let gameState = 'playing'; // playing, won
+
+// Parsear nivel
+function loadLevel(idx) {
+    if (idx >= levels.length) {
+        gameState = 'won';
+        return;
+    }
+    
+    currentLevelIdx = idx;
+    document.getElementById('level-display').innerText = idx + 1;
+    
+    const layout = levels[idx];
+    mapData = [];
+    entities = [];
+    particles = [];
+    
+    // Dimensiones del mapa
+    const h = layout.length;
+    const w = layout[0].length;
+    
+    // Crear mapa 2D
+    for(let y=0; y<h; y++) {
+        let row = [];
+        for(let x=0; x<w; x++) {
+            let char = layout[y][x];
+            if(char === 'P') {
+                player = new Player(x * TILE_SIZE, y * TILE_SIZE);
+                row.push('.');
+            } else if (char === 'M') {
+                entities.push({
+                    type: 'moving_platform',
+                    x: x * TILE_SIZE, y: y * TILE_SIZE, w: TILE_SIZE, h: TILE_SIZE/2,
+                    originX: x * TILE_SIZE, originY: y * TILE_SIZE,
+                    vx: 2, vy: 0, range: 100, offset: 0
+                });
+                row.push('.');
+            } else if (char === 'W') {
+                entities.push({
+                    type: 'wind',
+                    x: x * TILE_SIZE, y: y * TILE_SIZE, w: TILE_SIZE, h: TILE_SIZE,
+                    vx: 0.5, vy: 0 // Viento hacia la derecha
+                });
+                row.push('.');
+            } else {
+                row.push(char);
+            }
+        }
+        mapData.push(row);
+    }
+
+    // Ajustar cámara inicial
+    camera.x = player.x - canvas.width/2;
+    camera.y = player.y - canvas.height/2;
+}
+
+function getTile(x, y) {
+    if (y < 0 || y >= mapData.length || x < 0 || x >= mapData[0].length) return '.';
+    return mapData[y][x];
+}
+
+function die() {
+    deaths++;
+    document.getElementById('death-display').innerText = deaths;
+    
+    // Efecto de explosión
+    for(let i=0; i<20; i++) {
+        particles.push(new Particle(player.x + player.w/2, player.y + player.h/2, COLORS.player, 6, 40));
+    }
+    
+    // Reinicio rápido
+    loadLevel(currentLevelIdx);
+}
+
+function nextLevel() {
+    loadLevel(currentLevelIdx + 1);
+}
+
+// --- BUCLE PRINCIPAL ---
+
+function update() {
+    if (gameState === 'won') {
+        if(keys.restart) {
+            deaths = 0;
+            document.getElementById('death-display').innerText = 0;
+            gameState = 'playing';
+            loadLevel(0);
+        }
+        return;
+    }
+
+    if (keys.restart) {
+        loadLevel(currentLevelIdx);
+    }
+
+    player.update({getTile, height: mapData.length, width: mapData[0].length}, entities);
+
+    // Actualizar entidades
+    entities.forEach(e => {
+        if(e.type === 'moving_platform') {
+            e.offset += 0.05;
+            e.x = e.originX + Math.sin(e.offset) * e.range;
+            // Mover jugador si está encima (ya manejado en colisión, pero necesitamos velocidad)
+            e.vx = Math.cos(e.offset) * e.range * 0.05; 
+        }
+    });
+
+    // Actualizar partículas
+    for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].update();
+        if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+
+    // Cámara suave (Lerp)
+    let targetCamX = player.x - canvas.width / 2 + player.w/2;
+    let targetCamY = player.y - canvas.height / 2 + player.h/2;
+    
+    // Clamp cámara a los bordes del mapa (opcional, aquí lo dejo libre para estilo)
+    camera.x += (targetCamX - camera.x) * 0.1;
+    camera.y += (targetCamY - camera.y) * 0.1;
+}
+
+function draw() {
+    // Limpiar
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Parallax simple (Fondo se mueve más lento)
+    ctx.save();
+    ctx.translate(-camera.x * 0.5, -camera.y * 0.5);
+    ctx.fillStyle = '#2a2e45';
+    // Dibujar algunas "montañas" de fondo decorativas
+    ctx.fillRect(100, 400, 200, 300);
+    ctx.fillRect(500, 300, 300, 400);
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(-Math.floor(camera.x), -Math.floor(camera.y));
+
+    // Dibujar Mapa
+    for (let y = 0; y < mapData.length; y++) {
+        for (let x = 0; x < mapData[0].length; x++) {
+            let tile = mapData[y][x];
+            let px = x * TILE_SIZE;
+            let py = y * TILE_SIZE;
+
+            if (tile === '#') {
+                ctx.fillStyle = COLORS.wall;
+                ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+                // Detalle pixel art simple
+                ctx.fillStyle = '#5c6080';
+                ctx.fillRect(px + 4, py + 4, TILE_SIZE - 8, TILE_SIZE - 8);
+            } else if (tile === '^') {
+                ctx.fillStyle = COLORS.spike;
+                ctx.beginPath();
+                ctx.moveTo(px, py + TILE_SIZE);
+                ctx.lineTo(px + TILE_SIZE / 2, py);
+                ctx.lineTo(px + TILE_SIZE, py + TILE_SIZE);
+                ctx.fill();
+            } else if (tile === 'E') {
+                ctx.fillStyle = COLORS.goal;
+                ctx.fillRect(px + 10, py + 10, TILE_SIZE - 20, TILE_SIZE - 20);
+                ctx.strokeStyle = 'white';
+                ctx.strokeRect(px + 10, py + 10, TILE_SIZE - 20, TILE_SIZE - 20);
+            }
+        }
+    }
+
+    // Dibujar Entidades
+    entities.forEach(e => {
+        if(e.type === 'moving_platform') {
+            ctx.fillStyle = '#9a8c98';
+            ctx.fillRect(e.x, e.y, e.w, e.h);
+        } else if (e.type === 'wind') {
+            ctx.fillStyle = COLORS.wind;
+            ctx.fillRect(e.x, e.y, e.w, e.h);
+            // Flechitas de viento
+            ctx.fillStyle = 'white';
+            ctx.fillRect(e.x + 10, e.y + 15, 20, 4);
+            ctx.fillRect(e.x + 25, e.y + 12, 5, 5); // punta flecha
+        }
+    });
+
+    // Dibujar Jugador y Partículas
+    if(gameState === 'playing') player.draw(ctx, 0, 0); // 0,0 porque ya aplicamos translate
+    
+    particles.forEach(p => p.draw(ctx, 0, 0));
+
+    ctx.restore();
+
+    // UI de Victoria
+    if (gameState === 'won') {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#fca311';
+        ctx.font = '40px "Press Start 2P"';
+        ctx.textAlign = 'center';
+        ctx.fillText("¡NIVEL COMPLETADO!", canvas.width/2, canvas.height/2 - 20);
+        ctx.fillStyle = 'white';
+        ctx.font = '20px "Press Start 2P"';
+        ctx.fillText(`Muertes totales: ${deaths}`, canvas.width/2, canvas.height/2 + 30);
+        ctx.fillText("Presiona R para reiniciar", canvas.width/2, canvas.height/2 + 70);
+    }
+}
+
+function loop() {
+    update();
+    draw();
+    requestAnimationFrame(loop);
+}
+
+// Iniciar
+loadLevel(0);
+loop();
+
+</script>
+</body>
+</html>
